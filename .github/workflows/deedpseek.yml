@@ -19,40 +19,31 @@ on:
 jobs:
   resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ── 2. Python ────────────────────────────────────────────────────────
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Install Python deps ────────────────────────────────────────────
-      #    requests  → fast HTTP-first path (no Chrome needed)
-      #    nodriver  → Chrome fallback if CF blocks plain HTTP
       - name: Install Python dependencies
         run: pip install requests nodriver
 
-      # ── 4. Install Chrome + Xvfb (only used if HTTP path hits CF) ────────
+      # Chrome + Xvfb — only used if ALL HTTP+proxy paths fail
       - name: Install Google Chrome and Xvfb
         run: |
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb xvfb
           google-chrome --version
 
-      # ── 5. Start Xvfb virtual display ────────────────────────────────────
-      #    Headed Chrome (no --headless flag) avoids CF bot detection.
-      #    Xvfb gives it a virtual screen to render into.
-      - name: Start Xvfb
+      - name: Start Xvfb virtual display
         run: |
           Xvfb :99 -screen 0 1280x900x24 &
           echo "DISPLAY=:99" >> $GITHUB_ENV
           sleep 2
 
-      # ── 6. Run resolver ───────────────────────────────────────────────────
       - name: Run deedpseek.py
         env:
           CI: "true"
@@ -69,7 +60,6 @@ jobs:
           fi
           python deedpseek.py $ARGS | tee result.json
 
-      # ── 7. Upload result ──────────────────────────────────────────────────
       - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
