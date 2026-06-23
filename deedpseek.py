@@ -34,9 +34,15 @@ import nodriver.cdp.network as cdp_network
 DEFAULT_INPUT_URL = "https://multiembed.mov/?video_id=1339713&tmdb=1"
 IS_CI = os.environ.get("CI", "false").lower() == "true"
 
-PAGE_LOAD_WAIT    = 12     # seconds after initial page load
-XHR_WAIT          = 10     # seconds to wait for response.php XHR
-PLAYVIDEO_WAIT    = 10     # seconds after loading playvideo.php
+# nodriver works MUCH better with headless=False (avoids CF bot detection).
+# In CI we rely on Xvfb (virtual display) so Chrome can run "headed" without
+# a real screen.  The workflow sets up Xvfb and exports DISPLAY before calling
+# this script, so we never pass headless=True to nodriver at all.
+FORCE_HEADLESS = False   # keep False; let Xvfb handle CI headlessness
+
+PAGE_LOAD_WAIT    = 18     # seconds after initial page load (a bit more for CI)
+XHR_WAIT          = 15     # seconds to wait for response.php XHR
+PLAYVIDEO_WAIT    = 12     # seconds after loading playvideo.php
 MAX_SERVER_PAGES  = 10
 
 # ── Regex ──────────────────────────────────────────────────────────────────
@@ -249,10 +255,22 @@ async def resolve_with_nodriver(
     browser = None
 
     try:
+        extra_args = []
+        if IS_CI:
+            # Headed mode via Xvfb — these flags help stability on GitHub Actions
+            extra_args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--window-size=1280,900",
+                "--start-maximized",
+            ]
         browser = await uc.start(
-            headless=IS_CI,
+            headless=FORCE_HEADLESS,          # always False — use Xvfb in CI
             browser_executable_path=chrome_bin,
             user_data_dir=user_data_dir,
+            browser_args=extra_args if extra_args else None,
         )
 
         # ── Step 1: open page, enable CDP network interception ─────────────
@@ -416,7 +434,8 @@ async def resolve_with_nodriver(
         "sources_found":     len(result.sources),
         "sources_processed": len(sources_to_try),
         "embed_urls_found":  len(result.embed_urls),
-        "headless":          IS_CI,
+        "headless":          FORCE_HEADLESS,
+        "xvfb_ci":           IS_CI,
     }
     return result
 
