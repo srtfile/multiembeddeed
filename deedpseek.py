@@ -577,30 +577,33 @@ def resolve_with_http(
         return result
 
     # ── Attempt 2: proxy rotation ──────────────────────────────────────────
+    # Don't pre-probe with the play_url token — it's single-use and expires fast.
+    # Instead, try each proxy directly for the full resolve and stop at first success.
     result.steps.append("── Direct failed — trying proxy rotation ──")
-    # Use the play redirect URL as probe target if we have it, else use the input host
-    probe_target = result.play_url or f"https://{urllib.parse.urlparse(input_url).netloc}/"
-    proxy = find_working_proxy(probe_target, result.steps)
-
-    if proxy:
-        result.steps.append(f"── Running full resolve via proxy {proxy} ──")
-        # Reset state for a fresh attempt through the proxy
-        result.sources   = []
+    for proxy in PROXY_LIST:
+        masked = proxy.split("@")[-1]  # hide credentials in logs
+        result.steps.append(f"  Trying proxy {masked} ...")
+        # Reset state for a fresh attempt
+        result.sources    = []
         result.embed_urls = []
-        result.play_url  = None
+        result.play_url   = None
         result.play_token = None
         try:
             sess = make_session(proxy)
             ok = http_resolve_with_session(sess, input_url, preferred_server, all_servers, result, step_offset=10)
         except Exception as exc:
             ok = False
-            result.errors.append(f"Proxy HTTP error: {exc}")
+            result.steps.append(f"    ✗ error: {exc}")
+            result.errors.append(f"Proxy {masked} error: {exc}")
+            continue
 
         if ok:
+            result.steps.append(f"  ✓ Proxy {masked} succeeded")
             result.used_live_http   = True
-            result.cf_bypass_method = f"live_http_proxy:{proxy}"
+            result.cf_bypass_method = f"live_http_proxy:{masked}"
             _finalize_http(result, started)
             return result
+        result.steps.append(f"  ✗ Proxy {masked} — no embeds found")
 
     result.errors.append("All HTTP paths failed (direct + all proxies)")
     result.status = "http_failed"
@@ -856,8 +859,17 @@ def resolve(
     if result.ok:
         return result
 
-    # Last resort: nodriver (Chrome via Xvfb in CI)
-    result.steps.append("→ All HTTP paths failed — falling back to nodriver (Chrome)")
+    # Last resort: nodriver — only if Chrome is actually installed
+    chrome_bin = (
+        shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        or shutil.which("chromium-browser") or shutil.which("chromium")
+    )
+    if not chrome_bin:
+        result.steps.append("→ nodriver skipped (Chrome not installed)")
+        result.status = "http_failed"
+        return result
+
+    result.steps.append(f"→ All HTTP paths failed — falling back to nodriver ({chrome_bin})")
     nd = asyncio.run(resolve_with_nodriver(input_url, preferred_server=preferred_server, all_servers=all_servers))
     nd.steps = result.steps + nd.steps
     return nd
