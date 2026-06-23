@@ -19,45 +19,46 @@ on:
 jobs:
   resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ── 2. Python ────────────────────────────────────────────────────────
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Install Google Chrome (stable) ────────────────────────────────
       - name: Install Google Chrome
         run: |
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
           google-chrome --version
 
-      # ── 4. Smoke-test Chrome can actually launch ──────────────────────────
-      #    If this fails, we see the real crash reason before nodriver hides it.
-      - name: Smoke-test Chrome headless
+      - name: Install and start Xvfb
         run: |
-          timeout 10 google-chrome \
-            --headless=new \
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1280x900x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+
+      - name: Smoke-test Chrome headed via Xvfb
+        env:
+          DISPLAY: ":99"
+        run: |
+          timeout 15 google-chrome \
             --no-sandbox \
             --disable-dev-shm-usage \
             --disable-gpu \
             --dump-dom \
             about:blank 2>&1 | tail -5 || true
 
-      # ── 5. Install Python deps ────────────────────────────────────────────
       - name: Install Python dependencies
         run: pip install nodriver
 
-      # ── 6. Run resolver ───────────────────────────────────────────────────
       - name: Run deedpseek.py
         env:
           CI: "true"
-          # Give Chrome a writable tmpdir in the workspace (avoids /tmp permission issues)
+          DISPLAY: ":99"
           TMPDIR: "${{ github.workspace }}/.chrome-tmp"
         run: |
           mkdir -p "${{ github.workspace }}/.chrome-tmp"
@@ -70,7 +71,6 @@ jobs:
           fi
           python deedpseek.py $ARGS | tee result.json
 
-      # ── 7. Upload result ──────────────────────────────────────────────────
       - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
