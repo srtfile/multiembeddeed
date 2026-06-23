@@ -31,22 +31,36 @@ jobs:
           python-version: "3.11"
 
       # ── 3. Install Google Chrome (stable) ────────────────────────────────
-      #    Download the .deb directly — avoids GPG keyring/TTY issues in CI.
       - name: Install Google Chrome
         run: |
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
           google-chrome --version
 
-      # ── 4. Install Python deps ────────────────────────────────────────────
+      # ── 4. Smoke-test Chrome can actually launch ──────────────────────────
+      #    If this fails, we see the real crash reason before nodriver hides it.
+      - name: Smoke-test Chrome headless
+        run: |
+          timeout 10 google-chrome \
+            --headless=new \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --dump-dom \
+            about:blank 2>&1 | tail -5 || true
+
+      # ── 5. Install Python deps ────────────────────────────────────────────
       - name: Install Python dependencies
         run: pip install nodriver
 
-      # ── 5. Run resolver ───────────────────────────────────────────────────
+      # ── 6. Run resolver ───────────────────────────────────────────────────
       - name: Run deedpseek.py
         env:
-          CI: "true"          # triggers headless=True in the script
+          CI: "true"
+          # Give Chrome a writable tmpdir in the workspace (avoids /tmp permission issues)
+          TMPDIR: "${{ github.workspace }}/.chrome-tmp"
         run: |
+          mkdir -p "${{ github.workspace }}/.chrome-tmp"
           ARGS="${{ github.event.inputs.url }}"
           if [ -n "${{ github.event.inputs.server_id }}" ]; then
             ARGS="$ARGS --server-id ${{ github.event.inputs.server_id }}"
@@ -56,7 +70,7 @@ jobs:
           fi
           python deedpseek.py $ARGS | tee result.json
 
-      # ── 6. Upload result ──────────────────────────────────────────────────
+      # ── 7. Upload result ──────────────────────────────────────────────────
       - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
