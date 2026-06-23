@@ -261,6 +261,7 @@ async def resolve_with_nodriver(
         browser = await uc.start(
             headless=IS_CI,           # True in CI, False locally (easier to debug)
             browser_args=CHROME_ARGS,
+            no_sandbox=IS_CI,         # required when running as root (GitHub Actions)
         )
 
         # ── Step 1: open initial URL (multiembed.mov) ──────────────────────
