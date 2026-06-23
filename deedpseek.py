@@ -552,6 +552,7 @@ async def resolve_with_nodriver(
     try:
         browser = await uc.start(
             headless=False,
+            no_sandbox=True,
             browser_executable_path=chrome_bin,
             user_data_dir=user_data_dir,
             browser_args=[
