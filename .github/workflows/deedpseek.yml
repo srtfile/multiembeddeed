@@ -1,61 +1,71 @@
-name: deedpseek
+name: Stream Resolver
+
 on:
-  push:
-  pull_request:
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'lint | resolve | serve'
-        default: lint
       url:
-        description: 'URL to resolve (resolve mode)'
-        default: 'https://multiembed.mov/?video_id=1339713&tmdb=1'
+        description: "multiembed.mov URL to resolve"
+        required: true
+        default: "https://multiembed.mov/?video_id=1339713&tmdb=1"
+      server_id:
+        description: "Specific server ID (leave blank for all)"
+        required: false
+        default: ""
+      single:
+        description: "Single server only (true/false)"
+        required: false
+        default: "false"
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install curl_cffi>=0.7.0
-      - run: python -m py_compile deedpseek.py && echo "Syntax OK"
-      - run: |
-          python -c "
-          import sys, types
-          sys.modules.setdefault('nodriver', types.ModuleType('nodriver'))
-          import deedpseek
-          assert deedpseek.HAS_CURL_CFFI
-          assert not deedpseek.HAS_NODRIVER
-          assert deedpseek._is_ci()
-          print('Import guard OK')
-          "
-
   resolve:
-    needs: lint
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve'
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install curl_cffi>=0.7.0
-      - run: python deedpseek.py "${{ inputs.url }}" | tee result.json
-      - uses: actions/upload-artifact@v4
-        with: { name: result, path: result.json }
+    timeout-minutes: 15
 
-  serve:
-    needs: lint
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'serve'
-    runs-on: ubuntu-latest
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
       - uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install curl_cffi>=0.7.0
-      - run: python deedpseek.py --serve --host 0.0.0.0 --port 8787 &
-      - run: |
-          for i in $(seq 20); do
-            curl -sf http://localhost:8787/health && break || sleep 1
-          done
-          curl -sf http://localhost:8787/health | python -m json.tool
+        with:
+          python-version: "3.11"
+
+      # ── 3. Install Google Chrome (stable) ────────────────────────────────
+      #    nodriver drives a real Chrome binary; the ubuntu-latest runner
+      #    ships without it, so we install it here.
+      - name: Install Google Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+            | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+            https://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 4. Install Python deps ────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install nodriver
+
+      # ── 5. Run resolver ───────────────────────────────────────────────────
+      - name: Run deedpseek.py
+        env:
+          CI: "true"          # triggers headless=True in the script
+        run: |
+          ARGS="${{ github.event.inputs.url }}"
+          if [ -n "${{ github.event.inputs.server_id }}" ]; then
+            ARGS="$ARGS --server-id ${{ github.event.inputs.server_id }}"
+          fi
+          if [ "${{ github.event.inputs.single }}" = "true" ]; then
+            ARGS="$ARGS --single"
+          fi
+          python deedpseek.py $ARGS | tee result.json
+
+      # ── 6. Upload result ──────────────────────────────────────────────────
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolve-result
+          path: result.json
+          retention-days: 3
