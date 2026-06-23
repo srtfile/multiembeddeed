@@ -311,6 +311,55 @@ def is_hard_blocked(status_code: int, text: str) -> bool:
     return status_code in (403, 407, 429) or is_cf_blocked(text)
 
 
+def _decode_response(resp: requests.Response) -> str:
+    """
+    Return decoded text from a requests.Response, handling cases where
+    the server sends gzip/deflate/br even though requests didn't ask for it,
+    or the Content-Encoding header is missing/wrong.
+    """
+    import gzip
+    import zlib
+
+    raw = resp.content
+    if not raw:
+        return ""
+
+    # If requests already decoded it (Content-Encoding was set correctly), use it
+    # Check: if decoding as utf-8 works cleanly and doesn't look like binary, return it
+    ce = resp.headers.get("Content-Encoding", "").lower()
+    if ce in ("gzip", "deflate", "br") or not ce:
+        # Try requests' own decoded text first
+        try:
+            text = resp.text
+            # If it looks like printable text (not mostly control chars), use it
+            printable = sum(1 for c in text[:200] if c.isprintable() or c in "\r\n\t")
+            if len(text) > 0 and printable / min(len(text), 200) > 0.7:
+                return text
+        except Exception:
+            pass
+
+    # Manual gzip
+    try:
+        return gzip.decompress(raw).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    # Manual deflate (zlib)
+    try:
+        return zlib.decompress(raw).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    # deflate without zlib header
+    try:
+        return zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    # Give up — return whatever requests decoded
+    return resp.text
+
+
 # ── HTTP session builder ───────────────────────────────────────────────────
 
 def make_session(proxy: Optional[str] = None) -> requests.Session:
@@ -415,19 +464,21 @@ def http_resolve_with_session(
     })
     rphp = sess.post(response_php_url, data={"token": result.play_token}, timeout=30)
     total_requests += 1
-    result.steps.append(f"{n+4}. response.php: HTTP {rphp.status_code}, {len(rphp.text)} bytes")
 
-    if is_hard_blocked(rphp.status_code, rphp.text):
+    # Manually decompress if server ignored Accept-Encoding or sent raw gzip
+    rphp_text = _decode_response(rphp)
+    result.steps.append(f"{n+4}. response.php: HTTP {rphp.status_code}, {len(rphp_text)} chars")
+
+    if is_hard_blocked(rphp.status_code, rphp_text):
         result.errors.append(f"response.php blocked: HTTP {rphp.status_code}")
         return False
 
-    # Log a snippet of the raw response.php body for debugging
-    result.steps.append(f"   response.php body snippet: {rphp.text[:400]!r}")
+    # Log a snippet for debugging
+    result.steps.append(f"   response.php body snippet: {rphp_text[:400]!r}")
 
-    result.sources = extract_source_choices(rphp.text)
-    # Fallback: response.php may return JSON instead of HTML <li> elements
+    result.sources = extract_source_choices(rphp_text)
     if not result.sources:
-        result.sources = extract_source_choices_json(rphp.text)
+        result.sources = extract_source_choices_json(rphp_text)
     result.steps.append(f"{n+5}. Found {len(result.sources)} source(s)")
     if not result.sources:
         result.errors.append("No sources found in response.php")
@@ -618,8 +669,23 @@ async def resolve_with_nodriver(
         page = await browser.get(input_url)
         await enable_network_and_intercept(page, captured)
         result.steps.append("1. CDP network interception enabled")
-        await page.sleep(PAGE_LOAD_WAIT)
 
+        # Wait for page load + potential CF challenge (up to 30s total)
+        for tick in range(30):
+            await page.sleep(1)
+            current_url = await page.evaluate("window.location.href")
+            page_html_check = await page.get_content()
+            if is_cf_blocked(page_html_check):
+                if tick % 5 == 0:
+                    result.steps.append(f"   CF challenge active at t={tick}s, waiting...")
+                continue
+            # Page looks real
+            if tick >= 5:  # give it at least 5s for XHR to fire
+                break
+        else:
+            result.steps.append("   CF challenge never cleared after 30s")
+
+        # Extra wait for XHR (response.php) to fire after CF clears
         current_url = await page.evaluate("window.location.href")
         result.play_url   = current_url
         result.play_token = extract_play_token(current_url)
