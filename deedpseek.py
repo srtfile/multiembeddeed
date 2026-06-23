@@ -313,9 +313,9 @@ def is_hard_blocked(status_code: int, text: str) -> bool:
 
 def _decode_response(resp: requests.Response) -> str:
     """
-    Return decoded text from a requests.Response, handling cases where
-    the server sends gzip/deflate/br even though requests didn't ask for it,
-    or the Content-Encoding header is missing/wrong.
+    Robustly decode a response body, handling gzip/brotli/deflate even when
+    Content-Encoding is missing or wrong (common with proxy-fetched responses).
+    streamingnow.mov sends brotli (\\x1b magic byte) without a Content-Encoding header.
     """
     import gzip
     import zlib
@@ -324,40 +324,51 @@ def _decode_response(resp: requests.Response) -> str:
     if not raw:
         return ""
 
-    # If requests already decoded it (Content-Encoding was set correctly), use it
-    # Check: if decoding as utf-8 works cleanly and doesn't look like binary, return it
-    ce = resp.headers.get("Content-Encoding", "").lower()
-    if ce in ("gzip", "deflate", "br") or not ce:
-        # Try requests' own decoded text first
+    first = raw[0] if raw else 0
+
+    # Brotli: magic byte 0x1b (most common) or generally non-gzip/deflate binary
+    # Try brotli first if brotlipy/brotli is available
+    if first == 0x1b or (first not in (0x1f, 0x78, 0x28)):
         try:
-            text = resp.text
-            # If it looks like printable text (not mostly control chars), use it
-            printable = sum(1 for c in text[:200] if c.isprintable() or c in "\r\n\t")
-            if len(text) > 0 and printable / min(len(text), 200) > 0.7:
-                return text
+            import brotli
+            return brotli.decompress(raw).decode("utf-8", errors="replace")
         except Exception:
             pass
 
-    # Manual gzip
-    try:
-        return gzip.decompress(raw).decode("utf-8", errors="replace")
-    except Exception:
-        pass
+    # Gzip: magic bytes 0x1f 0x8b
+    if len(raw) >= 2 and raw[0] == 0x1f and raw[1] == 0x8b:
+        try:
+            return gzip.decompress(raw).decode("utf-8", errors="replace")
+        except Exception:
+            pass
 
-    # Manual deflate (zlib)
-    try:
-        return zlib.decompress(raw).decode("utf-8", errors="replace")
-    except Exception:
-        pass
+    # zlib/deflate: 0x78 ...
+    if first == 0x78:
+        try:
+            return zlib.decompress(raw).decode("utf-8", errors="replace")
+        except Exception:
+            pass
 
-    # deflate without zlib header
-    try:
-        return zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8", errors="replace")
-    except Exception:
-        pass
+    # Try all decoders regardless of magic byte
+    for decoder in (
+        lambda b: gzip.decompress(b).decode("utf-8", errors="replace"),
+        lambda b: zlib.decompress(b).decode("utf-8", errors="replace"),
+        lambda b: zlib.decompress(b, -zlib.MAX_WBITS).decode("utf-8", errors="replace"),
+    ):
+        try:
+            result = decoder(raw)
+            # Sanity: result should be mostly printable
+            printable = sum(1 for c in result[:200] if c.isprintable() or c in "\r\n\t")
+            if printable / max(min(len(result), 200), 1) > 0.7:
+                return result
+        except Exception:
+            pass
 
-    # Give up — return whatever requests decoded
-    return resp.text
+    # Last resort: decode as utf-8 directly (uncompressed response)
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return resp.text
 
 
 # ── HTTP session builder ───────────────────────────────────────────────────
