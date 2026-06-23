@@ -3,15 +3,15 @@
 Stream resolver - extracts embed URLs from streamingnow.mov.
 
 Strategy:
-  1. Pure HTTP path (requests + fake browser headers) — fast, no Chrome needed.
-     Works as long as the site doesn't serve a JS challenge to plain HTTP.
-  2. Fallback: nodriver (undetected Chrome via CDP) for when CF blocks HTTP.
+  1. Direct HTTP (no proxy) — works on non-blocked IPs (local machine).
+  2. Proxy rotation — tries each proxy in PROXY_LIST until one works (CI/datacenter IPs).
+  3. nodriver fallback — headed Chrome via Xvfb if all HTTP paths fail.
 
 Requires:
     pip install requests nodriver
 
 Run:
-    python deedpseek.py "https://multiembed.mov/?video_id=1084244&tmdb=1"
+    python deedpseek.py "https://multiembed.mov/?video_id=1339713&tmdb=1"
 """
 
 from __future__ import annotations
@@ -42,6 +42,21 @@ XHR_WAIT         = 10
 PLAYVIDEO_WAIT   = 10
 MAX_SERVER_PAGES = 10
 
+# Tried in order; first one that gets a real response wins.
+# US proxy is first — least likely to be geo-blocked by the target.
+PROXY_LIST = [
+    "http://20.47.108.204:8888",
+    "http://190.104.146.244:999",
+    "http://131.196.114.9:6969",
+    "http://117.2.28.235:55443",
+    "http://27.72.28.32:8008",
+    "http://187.190.118.141:999",
+    "http://101.255.94.161:8080",
+    "http://202.141.233.166:48995",
+    "http://140.246.149.224:8888",
+    "http://47.112.102.20:80",
+]
+
 # ── Regex ──────────────────────────────────────────────────────────────────
 PLAY_TOKEN_RE    = re.compile(r"""[?&]play=([^&"'<>]+)""", re.IGNORECASE)
 LOAD_SOURCES_RE  = re.compile(r"""load_sources\((['"])(?P<token>[^'"]+)\1\)""")
@@ -62,6 +77,25 @@ CF_MARKERS = [
     "Enable JavaScript and cookies to continue",
     "Checking your browser",
 ]
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
 # ── Data classes ───────────────────────────────────────────────────────────
@@ -218,34 +252,183 @@ def is_cf_blocked(text: str) -> bool:
     return any(m in text for m in CF_MARKERS)
 
 
+def is_hard_blocked(status_code: int, text: str) -> bool:
+    """True if the server is flat-out refusing us (IP block or CF)."""
+    return status_code in (403, 407, 429) or is_cf_blocked(text)
+
+
 # ── HTTP session builder ───────────────────────────────────────────────────
 
-def make_session() -> requests.Session:
-    """Return a requests.Session that looks like a real Chrome browser."""
+def make_session(proxy: Optional[str] = None) -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    })
+    s.headers.update(BROWSER_HEADERS)
     s.max_redirects = 10
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
     return s
 
 
-# ── Pure-HTTP resolver ─────────────────────────────────────────────────────
+def probe_proxy(proxy: str, test_url: str, timeout: int = 12) -> bool:
+    """Return True if this proxy can reach test_url and get a real page (not 403/CF)."""
+    try:
+        s = make_session(proxy)
+        r = s.get(test_url, timeout=timeout, allow_redirects=True)
+        if is_hard_blocked(r.status_code, r.text):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def find_working_proxy(test_url: str, steps: List[str]) -> Optional[str]:
+    """
+    Probe each proxy in PROXY_LIST against test_url.
+    Returns the first proxy that gets a real response, or None.
+    """
+    steps.append(f"  Probing {len(PROXY_LIST)} proxies against {test_url[:50]}...")
+    for proxy in PROXY_LIST:
+        steps.append(f"    Trying proxy {proxy} ...")
+        if probe_proxy(proxy, test_url):
+            steps.append(f"    ✓ Proxy works: {proxy}")
+            return proxy
+        steps.append(f"    ✗ Proxy failed: {proxy}")
+    return None
+
+
+# ── Core HTTP fetch logic (shared by direct + proxy paths) ────────────────
+
+def http_resolve_with_session(
+    sess: requests.Session,
+    input_url: str,
+    preferred_server: Optional[str],
+    all_servers: bool,
+    result: ResolveResult,
+    step_offset: int = 0,
+) -> bool:
+    """
+    Run the full HTTP resolve flow using `sess`.
+    Populates result in-place. Returns True if embed URLs were found.
+    step_offset shifts the step numbers so proxy attempts don't clash.
+    """
+    n = step_offset
+    total_requests = 0
+
+    # Step 1: initial GET
+    resp = sess.get(input_url, timeout=30, allow_redirects=False)
+    total_requests += 1
+    result.steps.append(f"{n+1}. Initial GET: HTTP {resp.status_code}")
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        location = resp.headers.get("Location", "")
+        result.steps.append(f"{n+2}. Redirect → {urllib.parse.urlparse(location).netloc}")
+        play_url = location
+    elif resp.status_code == 200:
+        play_url = resp.url
+        result.steps.append(f"{n+2}. No redirect, URL: {play_url[:80]}")
+    else:
+        result.errors.append(f"Initial GET returned HTTP {resp.status_code}")
+        return False
+
+    result.play_token = extract_play_token(play_url)
+    result.play_url   = play_url
+
+    # Step 3: GET play page
+    sess.headers.update({"Referer": input_url})
+    play_resp = sess.get(play_url, timeout=30)
+    total_requests += 1
+    play_html = play_resp.text
+    result.steps.append(f"{n+3}. Play page: HTTP {play_resp.status_code}, {len(play_html)} bytes")
+
+    if is_hard_blocked(play_resp.status_code, play_html):
+        result.errors.append(f"Play page blocked: HTTP {play_resp.status_code}")
+        return False
+
+    if not result.play_token:
+        result.play_token = extract_play_token(play_html)
+    if not result.play_token:
+        result.errors.append("No play token found")
+        return False
+
+    # Step 4: POST to response.php
+    response_php_url = urllib.parse.urljoin(play_resp.url, "/response.php")
+    sess.headers.update({
+        "Referer":          play_resp.url,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type":     "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest":   "empty",
+        "Sec-Fetch-Mode":   "cors",
+        "Sec-Fetch-Site":   "same-origin",
+    })
+    rphp = sess.post(response_php_url, data={"token": result.play_token}, timeout=30)
+    total_requests += 1
+    result.steps.append(f"{n+4}. response.php: HTTP {rphp.status_code}, {len(rphp.text)} bytes")
+
+    if is_hard_blocked(rphp.status_code, rphp.text):
+        result.errors.append(f"response.php blocked: HTTP {rphp.status_code}")
+        return False
+
+    result.sources = extract_source_choices(rphp.text)
+    result.steps.append(f"{n+5}. Found {len(result.sources)} source(s)")
+    if not result.sources:
+        result.errors.append("No sources found in response.php")
+        return False
+
+    # Pick servers
+    if all_servers:
+        sources_to_try = result.sources[:MAX_SERVER_PAGES]
+    elif preferred_server:
+        sources_to_try = [s for s in result.sources if s.server_id == preferred_server] or result.sources[:1]
+    else:
+        priority = ["21", "89", "90", "88", "29", "12", "41", "50", "45", "34", "38"]
+        ordered  = sorted(result.sources, key=lambda s: priority.index(s.server_id) if s.server_id in priority else 99)
+        sources_to_try = ordered[:MAX_SERVER_PAGES]
+
+    result.steps.append(f"{n+6}. Processing {len(sources_to_try)} server(s)")
+
+    # Reset to document headers for playvideo.php
+    sess.headers.update({
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+    })
+    if "Content-Type" in sess.headers:
+        del sess.headers["Content-Type"]
+
+    for source in sources_to_try:
+        playvideo_url = (
+            urllib.parse.urljoin(play_resp.url, "/playvideo.php")
+            + f"?video_id={urllib.parse.quote(source.video_id)}"
+            + f"&server_id={urllib.parse.quote(source.server_id)}"
+            + f"&token={urllib.parse.quote(result.play_token)}&init=1"
+        )
+        result.steps.append(f"  Server {source.server_id}: {source.label[:50]}")
+        sess.headers.update({"Referer": play_resp.url})
+
+        for attempt in range(1, 3):
+            try:
+                pv = sess.get(playvideo_url, timeout=30)
+                total_requests += 1
+                pv_html = pv.text
+                result.steps.append(f"    attempt {attempt}: HTTP {pv.status_code}, {len(pv_html)} bytes")
+                if is_hard_blocked(pv.status_code, pv_html):
+                    result.steps.append(f"    blocked — skipping server")
+                    break
+                found = extract_embed_urls_from_html(pv_html, pv.url)
+                result.steps.append(f"    Found {len(found)} embed URL(s)")
+                for eu in found:
+                    result.steps.append(f"      → {eu[:80]}")
+                    if eu not in result.embed_urls:
+                        result.embed_urls.append(eu)
+                break
+            except requests.RequestException as exc:
+                result.steps.append(f"    attempt {attempt} error: {exc}")
+                time.sleep(1)
+
+    result.stats["total_requests"] = result.stats.get("total_requests", 0) + total_requests
+    return bool(result.embed_urls)
+
+
+# ── Pure-HTTP resolver (direct then proxy) ────────────────────────────────
 
 def resolve_with_http(
     input_url: str,
@@ -254,162 +437,68 @@ def resolve_with_http(
 ) -> ResolveResult:
     result = ResolveResult(input_url=input_url, ok=False, status="http")
     started = time.time()
-    sources_to_try: List[SourceChoice] = []
-    total_requests = 0
+    result.stats["total_requests"] = 0
 
-    sess = make_session()
-
+    # ── Attempt 1: direct (no proxy) ──────────────────────────────────────
+    result.steps.append("── Direct HTTP (no proxy) ──")
     try:
-        # ── Step 1: GET input URL, follow redirects ────────────────────────
-        resp = sess.get(input_url, timeout=30, allow_redirects=False)
-        total_requests += 1
-        result.steps.append(f"1. Initial GET: HTTP {resp.status_code}")
-
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location", "")
-            result.steps.append(f"2. Redirect → {urllib.parse.urlparse(location).netloc}")
-            play_url = location
-        elif resp.status_code == 200:
-            play_url = resp.url
-            result.steps.append(f"2. No redirect, URL: {play_url[:80]}")
-        else:
-            result.errors.append(f"Unexpected status on initial GET: {resp.status_code}")
-            return result
-
-        # Extract token from redirect URL
-        result.play_token = extract_play_token(play_url)
-        result.play_url   = play_url
-
-        # ── Step 2: GET the play page ──────────────────────────────────────
-        # Update Referer to look natural
-        sess.headers.update({"Referer": input_url})
-        play_resp = sess.get(play_url, timeout=30)
-        total_requests += 1
-        play_html = play_resp.text
-        result.steps.append(f"3. Play page: HTTP {play_resp.status_code}, {len(play_html)} bytes")
-
-        if is_cf_blocked(play_html):
-            result.errors.append("Cloudflare challenge on play page — HTTP path blocked")
-            result.status = "cf_blocked"
-            return result
-
-        # Try extracting token from page HTML if not in URL
-        if not result.play_token:
-            result.play_token = extract_play_token(play_html)
-
-        if not result.play_token:
-            result.errors.append("No play token found in URL or page HTML")
-            return result
-
-        # ── Step 3: POST to response.php ───────────────────────────────────
-        response_php_url = urllib.parse.urljoin(play_resp.url, "/response.php")
-        sess.headers.update({
-            "Referer":          play_resp.url,
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type":     "application/x-www-form-urlencoded",
-            "Sec-Fetch-Dest":   "empty",
-            "Sec-Fetch-Mode":   "cors",
-            "Sec-Fetch-Site":   "same-origin",
-        })
-        rphp = sess.post(
-            response_php_url,
-            data={"token": result.play_token},
-            timeout=30,
-        )
-        total_requests += 1
-        result.steps.append(f"4. response.php: HTTP {rphp.status_code}, {len(rphp.text)} bytes")
-
-        if is_cf_blocked(rphp.text):
-            result.errors.append("Cloudflare challenge on response.php — HTTP path blocked")
-            result.status = "cf_blocked"
-            return result
-
-        result.sources = extract_source_choices(rphp.text)
-        result.steps.append(f"5. Found {len(result.sources)} source(s)")
-
-        if not result.sources:
-            result.errors.append("No sources found in response.php body")
-            return result
-
-        # ── Step 4: pick servers ───────────────────────────────────────────
-        if all_servers:
-            sources_to_try = result.sources[:MAX_SERVER_PAGES]
-        elif preferred_server:
-            sources_to_try = [s for s in result.sources if s.server_id == preferred_server] or result.sources[:1]
-        else:
-            priority = ["21", "89", "90", "88", "29", "12", "41", "50", "45", "34", "38"]
-            ordered  = sorted(result.sources, key=lambda s: priority.index(s.server_id) if s.server_id in priority else 99)
-            sources_to_try = ordered[:MAX_SERVER_PAGES]
-
-        result.steps.append(f"6. Processing {len(sources_to_try)} server(s)")
-
-        # Reset to document-fetch headers for playvideo.php
-        sess.headers.update({
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Content-Type":   "",   # clear POST header
-        })
-        del sess.headers["Content-Type"]
-
-        for source in sources_to_try:
-            playvideo_url = (
-                urllib.parse.urljoin(play_resp.url, "/playvideo.php")
-                + f"?video_id={urllib.parse.quote(source.video_id)}"
-                + f"&server_id={urllib.parse.quote(source.server_id)}"
-                + f"&token={urllib.parse.quote(result.play_token)}&init=1"
-            )
-            result.steps.append(f"  Server {source.server_id}: {source.label[:50]}")
-            sess.headers.update({"Referer": play_resp.url})
-
-            for attempt in range(1, 3):
-                try:
-                    pv = sess.get(playvideo_url, timeout=30)
-                    total_requests += 1
-                    pv_html = pv.text
-                    result.steps.append(f"    attempt {attempt}: HTTP {pv.status_code}, {len(pv_html)} bytes")
-
-                    if is_cf_blocked(pv_html):
-                        result.steps.append(f"    CF challenge — skipping")
-                        break
-
-                    found = extract_embed_urls_from_html(pv_html, pv.url)
-                    result.steps.append(f"    Found {len(found)} embed URL(s)")
-                    for eu in found:
-                        result.steps.append(f"      → {eu[:80]}")
-                        if eu not in result.embed_urls:
-                            result.embed_urls.append(eu)
-                    break
-                except requests.RequestException as exc:
-                    result.steps.append(f"    attempt {attempt} error: {exc}")
-                    time.sleep(1)
-
+        sess = make_session()
+        ok = http_resolve_with_session(sess, input_url, preferred_server, all_servers, result, step_offset=0)
     except Exception as exc:
-        result.errors.append(f"HTTP fatal: {type(exc).__name__}: {exc}")
-        result.steps.append(f"FATAL: {traceback.format_exc()[-400:]}")
+        ok = False
+        result.errors.append(f"Direct HTTP error: {exc}")
 
+    if ok:
+        result.used_live_http   = True
+        result.cf_bypass_method = "live_http_direct"
+        _finalize_http(result, started)
+        return result
+
+    # ── Attempt 2: proxy rotation ──────────────────────────────────────────
+    result.steps.append("── Direct failed — trying proxy rotation ──")
+    # Use the play redirect URL as probe target if we have it, else use the input host
+    probe_target = result.play_url or f"https://{urllib.parse.urlparse(input_url).netloc}/"
+    proxy = find_working_proxy(probe_target, result.steps)
+
+    if proxy:
+        result.steps.append(f"── Running full resolve via proxy {proxy} ──")
+        # Reset state for a fresh attempt through the proxy
+        result.sources   = []
+        result.embed_urls = []
+        result.play_url  = None
+        result.play_token = None
+        try:
+            sess = make_session(proxy)
+            ok = http_resolve_with_session(sess, input_url, preferred_server, all_servers, result, step_offset=10)
+        except Exception as exc:
+            ok = False
+            result.errors.append(f"Proxy HTTP error: {exc}")
+
+        if ok:
+            result.used_live_http   = True
+            result.cf_bypass_method = f"live_http_proxy:{proxy}"
+            _finalize_http(result, started)
+            return result
+
+    result.errors.append("All HTTP paths failed (direct + all proxies)")
+    result.status = "http_failed"
+    _finalize_http(result, started)
+    return result
+
+
+def _finalize_http(result: ResolveResult, started: float):
     elapsed = round(time.time() - started, 1)
     result.embed_urls = unique_keep_order([u for u in result.embed_urls if u and u != "https://"])
     result.ok   = bool(result.embed_urls)
-
     if result.ok:
         result.steps.append(f"✓ SUCCESS: {len(result.embed_urls)} embed URL(s) in {elapsed}s")
         result.status = "ok"
-    else:
-        result.status = result.status if result.status != "http" else "no_embeds"
-
-    result.stats = {
-        "total_requests":     total_requests,
-        "elapsed_seconds":    elapsed,
-        "requests_per_second": round(total_requests / elapsed, 2) if elapsed else 0,
-        "sources_found":      len(result.sources),
-        "sources_processed":  len(sources_to_try),
-        "embed_urls_found":   len(result.embed_urls),
-    }
-    result.used_live_http   = True
-    result.used_nodriver    = False
-    result.cf_bypass_method = "live_http"
-    return result
+    result.stats.update({
+        "elapsed_seconds":     elapsed,
+        "requests_per_second": round(result.stats.get("total_requests", 0) / elapsed, 2) if elapsed else 0,
+        "sources_found":       len(result.sources),
+        "embed_urls_found":    len(result.embed_urls),
+    })
 
 
 # ── CDP network interception ───────────────────────────────────────────────
@@ -422,19 +511,17 @@ async def enable_network_and_intercept(page, captured_responses: dict):
         url = event.response.url
         if "response.php" in url or "playvideo.php" in url:
             try:
-                body, is_b64 = await page.send(cdp_network.get_response_body(event.request_id))
+                body, _ = await page.send(cdp_network.get_response_body(event.request_id))
                 for key in ("response.php", "playvideo.php"):
                     if key in url:
-                        if key not in captured_responses:
-                            captured_responses[key] = []
-                        captured_responses[key].append({"url": url, "body": body})
+                        captured_responses.setdefault(key, []).append({"url": url, "body": body})
             except Exception:
                 pass
 
     page.add_handler(cdp_network.ResponseReceived, on_response_received)
 
 
-# ── nodriver fallback resolver ─────────────────────────────────────────────
+# ── nodriver fallback ──────────────────────────────────────────────────────
 
 async def resolve_with_nodriver(
     input_url: str,
@@ -442,42 +529,34 @@ async def resolve_with_nodriver(
     all_servers: bool = True,
 ) -> ResolveResult:
     import nodriver as uc
-    import nodriver.cdp.network as cdp_network
 
     result = ResolveResult(input_url=input_url, ok=False, status="nodriver")
     started = time.time()
     sources_to_try: List[SourceChoice] = []
 
     chrome_bin = (
-        shutil.which("google-chrome")
-        or shutil.which("google-chrome-stable")
-        or shutil.which("chromium-browser")
-        or shutil.which("chromium")
+        shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        or shutil.which("chromium-browser") or shutil.which("chromium")
         or "/usr/bin/google-chrome"
     )
     user_data_dir = tempfile.mkdtemp(prefix="nodriver_")
     browser = None
 
     try:
-        # Always launch headed — use Xvfb in CI instead of --headless
-        extra_args = [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--window-size=1280,900",
-        ]
         browser = await uc.start(
             headless=False,
             browser_executable_path=chrome_bin,
             user_data_dir=user_data_dir,
-            browser_args=extra_args,
+            browser_args=[
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--disable-gpu", "--window-size=1280,900",
+            ],
         )
 
         captured = {}
         page = await browser.get(input_url)
         await enable_network_and_intercept(page, captured)
         result.steps.append("1. CDP network interception enabled")
-
         await page.sleep(PAGE_LOAD_WAIT)
 
         current_url = await page.evaluate("window.location.href")
@@ -519,18 +598,15 @@ async def resolve_with_nodriver(
                 }})()
             """)
             if js_result and not str(js_result).startswith("ERROR"):
-                result.steps.append(f"   JS fetch got {len(str(js_result))} bytes")
                 result.sources = extract_source_choices(str(js_result))
                 result.steps.append(f"   Sources from JS fetch: {len(result.sources)}")
             else:
-                result.steps.append(f"   JS fetch error: {str(js_result)[:100]}")
                 page_html = await page.get_content()
                 result.steps.append(f"   Page HTML snippet: {page_html[500:1500]}")
 
         if not result.play_token:
             result.errors.append("No play token found")
             return result
-
         if not result.sources:
             result.errors.append("No sources found after all attempts")
             return result
@@ -541,8 +617,9 @@ async def resolve_with_nodriver(
             sources_to_try = [s for s in result.sources if s.server_id == preferred_server] or result.sources[:1]
         else:
             priority = ["21", "89", "90", "88", "29", "12", "41", "50", "45", "34", "38"]
-            ordered  = sorted(result.sources, key=lambda s: priority.index(s.server_id) if s.server_id in priority else 99)
-            sources_to_try = ordered[:MAX_SERVER_PAGES]
+            sources_to_try = sorted(result.sources,
+                key=lambda s: priority.index(s.server_id) if s.server_id in priority else 99
+            )[:MAX_SERVER_PAGES]
 
         result.steps.append(f"4. Processing {len(sources_to_try)} server(s)")
 
@@ -554,7 +631,6 @@ async def resolve_with_nodriver(
                 + f"&token={urllib.parse.quote(result.play_token)}&init=1"
             )
             result.steps.append(f"  [{idx+1}] Server {source.server_id}: {source.label[:40]}")
-
             try:
                 pv_captured = {}
                 pv_page = await browser.get(playvideo_url)
@@ -589,7 +665,6 @@ async def resolve_with_nodriver(
                     if eu not in result.embed_urls:
                         result.embed_urls.append(eu)
                         result.steps.append(f"      ✓ {eu[:80]}")
-
             except Exception as exc:
                 result.errors.append(f"Server {source.server_id}: {exc}")
                 result.steps.append(f"      ✗ {exc}")
@@ -597,13 +672,6 @@ async def resolve_with_nodriver(
     except Exception as exc:
         result.errors.append(f"nodriver fatal: {type(exc).__name__}: {exc}")
         result.steps.append(f"FATAL: {traceback.format_exc()[-600:]}")
-        if browser and hasattr(browser, '_process') and browser._process:
-            try:
-                raw = await asyncio.wait_for(browser._process.stderr.read(4096), timeout=2)
-                if raw:
-                    result.steps.append(f"Chrome stderr: {raw.decode('utf-8','replace')[-400:]}")
-            except Exception:
-                pass
     finally:
         if browser:
             try:
@@ -613,22 +681,22 @@ async def resolve_with_nodriver(
 
     elapsed = round(time.time() - started, 1)
     result.embed_urls = unique_keep_order([u for u in result.embed_urls if u and u != "https://"])
-    result.ok   = bool(result.embed_urls)
+    result.ok     = bool(result.embed_urls)
     result.status = "ok" if result.ok else "no_embeds"
+    if result.ok:
+        result.steps.append(f"✓ SUCCESS: {len(result.embed_urls)} embed URL(s) in {elapsed}s")
     result.stats = {
         "elapsed_seconds":   elapsed,
         "sources_found":     len(result.sources),
         "sources_processed": len(sources_to_try),
         "embed_urls_found":  len(result.embed_urls),
-        "headless":          False,
     }
-    result.used_live_http   = False
     result.used_nodriver    = True
     result.cf_bypass_method = "nodriver"
     return result
 
 
-# ── Top-level resolver: HTTP first, nodriver fallback ─────────────────────
+# ── Top-level resolver ────────────────────────────────────────────────────
 
 def resolve(
     input_url: str,
@@ -636,35 +704,29 @@ def resolve(
     preferred_server: Optional[str] = None,
     all_servers: bool = True,
 ) -> ResolveResult:
-    # Try pure-HTTP first — fast and CF-friendly on most IPs
+    # HTTP first (direct, then proxy rotation)
     result = resolve_with_http(input_url, preferred_server=preferred_server, all_servers=all_servers)
     if result.ok:
         return result
 
-    # If CF blocked us or we got nothing, fall back to nodriver
-    if result.status in ("cf_blocked", "no_embeds") or not result.sources:
-        result.steps.append("→ HTTP failed, falling back to nodriver (Chrome)")
-        nd_result = asyncio.run(
-            resolve_with_nodriver(input_url, preferred_server=preferred_server, all_servers=all_servers)
-        )
-        # Merge steps so the full trace is visible
-        nd_result.steps = result.steps + nd_result.steps
-        return nd_result
-
-    return result
+    # Last resort: nodriver (Chrome via Xvfb in CI)
+    result.steps.append("→ All HTTP paths failed — falling back to nodriver (Chrome)")
+    nd = asyncio.run(resolve_with_nodriver(input_url, preferred_server=preferred_server, all_servers=all_servers))
+    nd.steps = result.steps + nd.steps
+    return nd
 
 
 # ── HTTP API ───────────────────────────────────────────────────────────────
 
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "StreamResolver/11.0"
+    server_version = "StreamResolver/12.0"
 
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         try:
             if parsed.path == "/health":
-                self.write_json({"ok": True, "mode": "http+nodriver"})
+                self.write_json({"ok": True, "mode": "http+proxy+nodriver"})
                 return
             if parsed.path == "/resolve":
                 input_url = (params.get("url") or [""])[0]
@@ -700,14 +762,14 @@ def serve(host: str, port: int):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Stream resolver (HTTP-first + nodriver fallback)")
+    parser = argparse.ArgumentParser(description="Stream resolver (HTTP+proxy+nodriver)")
     parser.add_argument("url", nargs="?", default=DEFAULT_INPUT_URL)
     parser.add_argument("--serve",     action="store_true")
     parser.add_argument("--host",      default="127.0.0.1")
     parser.add_argument("--port",      type=int, default=int(os.environ.get("PORT", "8787")))
     parser.add_argument("--server-id", default=None)
     parser.add_argument("--single",    action="store_true")
-    parser.add_argument("--http-only", action="store_true", help="Disable nodriver fallback")
+    parser.add_argument("--http-only", action="store_true", help="Skip nodriver fallback")
     args = parser.parse_args(argv)
 
     if args.serve:
@@ -716,16 +778,10 @@ def main(argv=None):
 
     if args.http_only:
         result = resolve_with_http(
-            args.url,
-            preferred_server=args.server_id,
-            all_servers=not args.single,
-        )
+            args.url, preferred_server=args.server_id, all_servers=not args.single)
     else:
         result = resolve(
-            args.url,
-            preferred_server=args.server_id,
-            all_servers=not args.single,
-        )
+            args.url, preferred_server=args.server_id, all_servers=not args.single)
 
     print(json.dumps(result.to_jsonable(), indent=2, ensure_ascii=False))
     return 0 if result.ok else 2
