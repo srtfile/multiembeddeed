@@ -29,26 +29,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install requests nodriver
-
-      # Chrome + Xvfb — only used if ALL HTTP+proxy paths fail
-      - name: Install Google Chrome and Xvfb
-        run: |
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb xvfb
-          google-chrome --version
-
-      - name: Start Xvfb virtual display
-        run: |
-          Xvfb :99 -screen 0 1280x900x24 &
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-          sleep 2
+        run: pip install requests nodriver brotli
 
       - name: Run deedpseek.py
-        env:
-          CI: "true"
-          DISPLAY: ":99"
-          TMPDIR: "${{ github.workspace }}/.chrome-tmp"
         run: |
           mkdir -p "${{ github.workspace }}/.chrome-tmp"
           ARGS="${{ github.event.inputs.url }}"
