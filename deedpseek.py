@@ -44,17 +44,24 @@ MAX_SERVER_PAGES = 10
 
 # Tried in order; first one that gets a real response wins.
 # US proxy is first — least likely to be geo-blocked by the target.
+_PROXY_USER = "iooshumq"
+_PROXY_PASS = "8x072nppng86"
+
+def _px(host: str, port: str) -> str:
+    return f"http://{_PROXY_USER}:{_PROXY_PASS}@{host}:{port}"
+
+# Authenticated residential proxies — US/UK first (least likely to be geo-blocked)
 PROXY_LIST = [
-    "http://20.47.108.204:8888",
-    "http://190.104.146.244:999",
-    "http://131.196.114.9:6969",
-    "http://117.2.28.235:55443",
-    "http://27.72.28.32:8008",
-    "http://187.190.118.141:999",
-    "http://101.255.94.161:8080",
-    "http://202.141.233.166:48995",
-    "http://140.246.149.224:8888",
-    "http://47.112.102.20:80",
+    _px("38.154.203.95",  "5863"),   # US – Piscataway
+    _px("198.23.243.226", "6361"),   # US – Los Angeles
+    _px("38.154.185.97",  "6370"),   # US – Piscataway
+    _px("191.96.254.138", "6185"),   # US – Los Angeles
+    _px("31.56.127.193",  "7684"),   # US – Seattle
+    _px("31.59.20.176",   "6754"),   # UK – London
+    _px("45.38.107.97",   "6014"),   # UK – London
+    _px("198.105.121.200","6462"),   # UK – London
+    _px("64.137.96.74",   "6641"),   # ES – Madrid
+    _px("142.111.67.146", "5611"),   # JP – Tokyo
 ]
 
 # ── Regex ──────────────────────────────────────────────────────────────────
