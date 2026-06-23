@@ -224,7 +224,22 @@ async def resolve_with_nodriver(
     try:
         # nodriver auto-detects root → sandbox=False; we just set headless for CI.
         # Passing no browser_args so nodriver's own safe defaults apply.
-        browser = await uc.start(headless=IS_CI)
+        # Explicit binary path + user-data-dir avoids nodriver auto-detect failures in CI.
+        # sandbox=True is fine — nodriver auto-sets False when it detects root (uid==0).
+        import shutil, tempfile
+        chrome_bin = (
+            shutil.which("google-chrome")
+            or shutil.which("google-chrome-stable")
+            or shutil.which("chromium-browser")
+            or shutil.which("chromium")
+            or "/usr/bin/google-chrome"
+        )
+        user_data_dir = tempfile.mkdtemp(prefix="nodriver_")
+        browser = await uc.start(
+            headless=IS_CI,
+            browser_executable_path=chrome_bin,
+            user_data_dir=user_data_dir,
+        )
 
         # ── Step 1: open initial URL ────────────────────────────────────────
         page = await browser.get(input_url)
@@ -322,6 +337,14 @@ async def resolve_with_nodriver(
     except Exception as exc:
         result.errors.append(f"nodriver fatal: {type(exc).__name__}: {exc}")
         result.steps.append(f"FATAL: {traceback.format_exc()[-500:]}")
+        # Capture Chrome stderr if available (helps diagnose crash in CI)
+        if browser and hasattr(browser, '_process') and browser._process:
+            try:
+                raw = await asyncio.wait_for(browser._process.stderr.read(4096), timeout=2)
+                if raw:
+                    result.steps.append(f"Chrome stderr: {raw.decode('utf-8','replace')[-400:]}")
+            except Exception:
+                pass
     finally:
         if browser:
             try:
