@@ -217,6 +217,53 @@ def extract_source_choices(response_html: str) -> List[SourceChoice]:
     return sources
 
 
+def extract_source_choices_json(text: str) -> List[SourceChoice]:
+    """
+    Fallback: response.php may return JSON like:
+      [{"id":"123","server":"21","label":"Server 1"}, ...]
+    or a wrapper like {"sources": [...], "links": [...]}
+    """
+    sources = []
+    try:
+        data = json.loads(text)
+    except Exception:
+        # Try to find a JSON array/object embedded in the text
+        m = re.search(r'(\[[\s\S]*\]|\{[\s\S]*\})', text)
+        if not m:
+            return sources
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            return sources
+
+    # Unwrap common envelope keys
+    if isinstance(data, dict):
+        for key in ("sources", "links", "servers", "data", "items", "result"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            # Single object — wrap it
+            data = [data]
+
+    if not isinstance(data, list):
+        return sources
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        # Try multiple field-name conventions used by multiembed/streamingnow
+        video_id  = (item.get("id") or item.get("video_id") or item.get("vid") or "").strip()
+        server_id = (item.get("server") or item.get("server_id") or item.get("sid") or "").strip()
+        if not video_id or not server_id:
+            continue
+        label   = str(item.get("label") or item.get("name") or item.get("title") or "")
+        quality = str(item.get("quality") or item.get("q") or "")
+        sources.append(SourceChoice(video_id=video_id, server_id=server_id,
+                                    label=label, quality=quality))
+    return sources
+
+
 def extract_embed_urls_from_html(html_content: str, base_url: str) -> List[str]:
     urls = []
     for m in IFRAME_SRC_RE.finditer(html_content):
@@ -374,7 +421,13 @@ def http_resolve_with_session(
         result.errors.append(f"response.php blocked: HTTP {rphp.status_code}")
         return False
 
+    # Log a snippet of the raw response.php body for debugging
+    result.steps.append(f"   response.php body snippet: {rphp.text[:400]!r}")
+
     result.sources = extract_source_choices(rphp.text)
+    # Fallback: response.php may return JSON instead of HTML <li> elements
+    if not result.sources:
+        result.sources = extract_source_choices_json(rphp.text)
     result.steps.append(f"{n+5}. Found {len(result.sources)} source(s)")
     if not result.sources:
         result.errors.append("No sources found in response.php")
@@ -581,12 +634,17 @@ async def resolve_with_nodriver(
         if "response.php" in captured:
             body = captured["response.php"][0]["body"]
             result.steps.append(f"3. Intercepted response.php ({len(body)} bytes)")
+            result.steps.append(f"   body snippet: {body[:300]!r}")
             result.sources = extract_source_choices(body)
+            if not result.sources:
+                result.sources = extract_source_choices_json(body)
             result.steps.append(f"   Sources from XHR: {len(result.sources)}")
         else:
             result.steps.append("3. response.php not intercepted — trying page HTML")
             page_html = await page.get_content()
             result.sources = extract_source_choices(page_html)
+            if not result.sources:
+                result.sources = extract_source_choices_json(page_html)
             result.steps.append(f"   Sources from page HTML: {len(result.sources)}")
 
         if not result.sources and result.play_token:
@@ -606,7 +664,11 @@ async def resolve_with_nodriver(
                 }})()
             """)
             if js_result and not str(js_result).startswith("ERROR"):
-                result.sources = extract_source_choices(str(js_result))
+                raw = str(js_result)
+                result.steps.append(f"   JS fetch body snippet: {raw[:300]!r}")
+                result.sources = extract_source_choices(raw)
+                if not result.sources:
+                    result.sources = extract_source_choices_json(raw)
                 result.steps.append(f"   Sources from JS fetch: {len(result.sources)}")
             else:
                 page_html = await page.get_content()
