@@ -33,31 +33,15 @@ DEFAULT_TIMEOUT = 60
 STREAMINGNOW_BASE = "https://streamingnow.mov"
 DEFAULT_INPUT_URL = "https://multiembed.mov/?video_id=1339713&tmdb=1"
 
-# ─── nodriver / Chrome configuration ────────────────────────────────────────
-# In GitHub Actions: headless=True + extra args for sandboxing
+# ─── CI detection ────────────────────────────────────────────────────────────
+# nodriver auto-detects root on Linux and disables sandbox automatically.
+# We just need headless=True in CI. Do NOT pass browser_args — nodriver's
+# built-in defaults (--disable-dev-shm-usage etc.) are correct for CI runners.
 IS_CI = os.environ.get("CI", "false").lower() == "true"
 
-CHROME_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-sync",
-    "--disable-translate",
-    "--disable-notifications",
-    "--disable-popup-blocking",
-    "--window-size=1280,800",
-    "--lang=en-US",
-    "--mute-audio",
-]
-
-PAGE_WAIT_MS       = 10_000   # wait after initial load
-SOURCES_WAIT_MS    = 6_000    # wait after clicking a server
-PLAYVIDEO_WAIT_MS  = 8_000    # wait for playvideo response
-MAX_SERVER_PAGES   = 10       # cap how many servers we process
+PAGE_WAIT_MS      = 10_000   # wait after initial load
+PLAYVIDEO_WAIT_MS = 8_000    # wait for playvideo response
+MAX_SERVER_PAGES  = 10       # cap how many servers we process
 
 # Regex patterns
 PLAY_TOKEN_RE    = re.compile(r"""[?&]play=([^&"'<>]+)""", re.IGNORECASE)
@@ -72,7 +56,7 @@ JS_SRC_ASSIGN_RE = re.compile(r"""\.src\s*=\s*['"]([^'"]*/(?:e|embed|d)/[^'"]+)[
 ANY_URL_RE       = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 
 
-# ─── Data classes ─────────────────────────────────────────────────────────────
+# ─── Data classes ──────────────────────────────────────────────────────────
 
 @dataclass
 class SourceChoice:
@@ -102,7 +86,7 @@ class ResolveResult:
         return data
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────
 
 def unique_keep_order(items: Iterable[str]) -> List[str]:
     seen, out = set(), []
@@ -225,28 +209,7 @@ def extract_embed_urls_from_html(html_content: str, base_url: str) -> List[str]:
     return unique_keep_order(urls)
 
 
-# ─── Network-request interceptor helper ──────────────────────────────────────
-
-def _make_request_interceptor(captured: list):
-    """
-    Returns an async handler that nodriver can attach via page.add_handler.
-    Captures XHR/fetch URLs that look like playvideo.php or response.php.
-    """
-    async def handler(event):
-        try:
-            url = getattr(event, "request", None)
-            if url:
-                url = getattr(url, "url", str(url))
-            else:
-                url = str(event)
-            if "playvideo.php" in url or "response.php" in url:
-                captured.append(url)
-        except Exception:
-            pass
-    return handler
-
-
-# ─── Core nodriver resolver ────────────────────────────────────────────────────
+# ─── Core nodriver resolver ────────────────────────────────────────────────
 
 async def resolve_with_nodriver(
     input_url: str,
@@ -255,32 +218,29 @@ async def resolve_with_nodriver(
 ) -> ResolveResult:
     result = ResolveResult(input_url=input_url, ok=False, status="nodriver")
     started = time.time()
+    sources_to_try = []
 
     browser = None
     try:
-        browser = await uc.start(
-            headless=IS_CI,           # True in CI, False locally (easier to debug)
-            browser_args=CHROME_ARGS,
-            no_sandbox=IS_CI,         # required when running as root (GitHub Actions)
-        )
+        # nodriver auto-detects root → sandbox=False; we just set headless for CI.
+        # Passing no browser_args so nodriver's own safe defaults apply.
+        browser = await uc.start(headless=IS_CI)
 
-        # ── Step 1: open initial URL (multiembed.mov) ──────────────────────
+        # ── Step 1: open initial URL ────────────────────────────────────────
         page = await browser.get(input_url)
         await page.sleep(PAGE_WAIT_MS / 1000)
 
         current_url = await page.evaluate("window.location.href")
         result.steps.append(f"1. Loaded: {current_url[:80]}")
 
-        # Grab the play token from the current URL or page source
         page_html = await page.get_content()
         result.play_token = extract_play_token(current_url) or extract_play_token(page_html)
         result.play_url   = current_url
 
-        # ── Step 2: look for source-list items in current page ─────────────
+        # ── Step 2: find source list ────────────────────────────────────────
         result.sources = extract_source_choices(page_html)
         result.steps.append(f"2. Sources on initial page: {len(result.sources)}")
 
-        # If no token/sources, maybe we need to wait for a redirect
         if not result.play_token or not result.sources:
             await page.sleep(5)
             current_url = await page.evaluate("window.location.href")
@@ -293,7 +253,7 @@ async def resolve_with_nodriver(
             result.errors.append("Could not find play token")
             return result
 
-        # ── Step 3: pick which servers to process ─────────────────────────
+        # ── Step 3: pick servers ────────────────────────────────────────────
         if all_servers:
             sources_to_try = result.sources[:MAX_SERVER_PAGES]
         elif preferred_server:
@@ -305,7 +265,7 @@ async def resolve_with_nodriver(
 
         result.steps.append(f"3. Processing {len(sources_to_try)} server(s)")
 
-        # ── Step 4: for each server, navigate playvideo.php directly ───────
+        # ── Step 4: visit each playvideo.php URL ────────────────────────────
         for idx, source in enumerate(sources_to_try):
             playvideo_url = (
                 urllib.parse.urljoin(result.play_url, "/playvideo.php")
@@ -315,7 +275,6 @@ async def resolve_with_nodriver(
             )
 
             result.steps.append(f"  [{idx+1}] Server {source.server_id} ({source.label[:40]})")
-            result.steps.append(f"      URL: {playvideo_url[:100]}")
 
             try:
                 pv_page = await browser.get(playvideo_url)
@@ -325,9 +284,8 @@ async def resolve_with_nodriver(
                 pv_cur_url = await pv_page.evaluate("window.location.href")
 
                 found = extract_embed_urls_from_html(pv_html, pv_cur_url)
-                result.steps.append(f"      → {len(found)} embed URL(s) from page HTML")
 
-                # Also check JS-evaluated iframes
+                # Also pull live DOM iframes/data-src via JS
                 js_urls = await pv_page.evaluate("""
                     (() => {
                         const out = [];
@@ -340,8 +298,8 @@ async def resolve_with_nodriver(
                     for u in js_urls:
                         if u and is_valid_embed_url(u) and u not in found:
                             found.append(u)
-                    result.steps.append(f"      + {len(js_urls)} from JS DOM")
 
+                result.steps.append(f"      → {len(found)} embed URL(s)")
                 for eu in found:
                     if eu not in result.embed_urls:
                         result.embed_urls.append(eu)
@@ -349,14 +307,13 @@ async def resolve_with_nodriver(
 
             except Exception as exc:
                 result.errors.append(f"Server {source.server_id}: {exc}")
-                result.steps.append(f"      ✗ error: {exc}")
+                result.steps.append(f"      ✗ {exc}")
 
-        # ── Step 5: also scan final page for any leftover embeds ──────────
+        # ── Step 5: scan final page too ────────────────────────────────────
         try:
             final_html    = await page.get_content()
             final_cur_url = await page.evaluate("window.location.href")
-            extra = extract_embed_urls_from_html(final_html, final_cur_url)
-            for eu in extra:
+            for eu in extract_embed_urls_from_html(final_html, final_cur_url):
                 if eu not in result.embed_urls:
                     result.embed_urls.append(eu)
         except Exception:
@@ -364,7 +321,7 @@ async def resolve_with_nodriver(
 
     except Exception as exc:
         result.errors.append(f"nodriver fatal: {type(exc).__name__}: {exc}")
-        result.steps.append(f"FATAL: {traceback.format_exc()[-300:]}")
+        result.steps.append(f"FATAL: {traceback.format_exc()[-500:]}")
     finally:
         if browser:
             try:
@@ -376,11 +333,11 @@ async def resolve_with_nodriver(
     result.ok     = bool(result.embed_urls)
     result.status = "ok" if result.ok else "no_embeds"
     result.stats  = {
-        "elapsed_seconds": round(time.time() - started, 1),
-        "sources_found":    len(result.sources),
-        "sources_processed": len(sources_to_try) if result.sources else 0,
-        "embed_urls_found":  len(result.embed_urls),
-        "headless": IS_CI,
+        "elapsed_seconds":    round(time.time() - started, 1),
+        "sources_found":      len(result.sources),
+        "sources_processed":  len(sources_to_try),
+        "embed_urls_found":   len(result.embed_urls),
+        "headless":           IS_CI,
     }
     return result
 
@@ -394,7 +351,7 @@ def resolve(
     return asyncio.run(resolve_with_nodriver(input_url, preferred_server, all_servers))
 
 
-# ─── HTTP API server ────────────────────────────────────────────────────────
+# ─── HTTP API server ───────────────────────────────────────────────────────
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "StreamResolver/9.0-nodriver"
